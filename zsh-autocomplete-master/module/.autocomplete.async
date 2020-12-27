@@ -1,0 +1,472 @@
+#!/bin/zsh
+
+.autocomplete.async.precmd() {
+  emulate -L zsh -o extendedglob
+  add-zsh-hook -d precmd .autocomplete.async.precmd
+
+  zmodload zsh/{system,zpty,zutil}
+  autoload -Uz .autocomplete.highlight .autocomplete.zle-flags
+
+  # Speed up completion by preloading essential functions.
+  autoload +X -Uz _all_labels _alternative _arguments _cache_invalid _call_function _combination \
+    _command_names _comp_locale _describe _description _dispatch _files _guard _message \
+    _multi_parts _next_label _normal _parameters _path_files _pick_variant _requested \
+    _retrieve_cache _sep_parts _setup _store_cache _tags _tilde_files _values _wanted
+
+  typeset -gHF _AUTOCOMPLETE__ASYNC_TIMEOUT=.1
+
+  typeset -gHi _autocomplete__async_complete_fd _autocomplete__async_complete_pid
+  zle -N .autocomplete.async.complete.fd-widget
+
+  typeset -gHi _autocomplete__async_timeout_fd _autocomplete__async_timeout_pid
+  zle -N .autocomplete.async.timeout.fd-widget
+
+  typeset -gHi _autocomplete__async_highlight_fd _autocomplete__async_highlight_pid
+  zle -N .autocomplete.async.highlight.fd-widget
+
+  typeset -gH _autocomplete__buffer _autocomplete__word
+  typeset -gHa _autocomplete__region_highlight=()
+
+  zle -C _list_choices list-choices .autocomplete.list-choices.completion-widget
+  zle -C _explain list-choices .autocomplete.async.explain.completion-widget
+
+  if [[ -v functions[_zsh_highlight_call_widget] ]]; then
+    _zsh_highlight_call_widget() {
+      .autocomplete.zle-flags $WIDGET
+      builtin zle "$@"
+    }
+  fi
+
+  if [[ -v functions[_zsh_autosuggest_disable] ]]; then
+    _zsh_autosuggest_disable
+    local action
+    for action in clear modify fetch suggest accept partial_accept execute enable disable toggle
+    do
+      eval "_zsh_autosuggest_widget_$action() {
+        .autocomplete.zle-flags \$WIDGET
+        _zsh_autosuggest_$action \$@
+      }"
+    done
+    functions[.autocomplete._zsh_autosuggest_suggest]=$functions[_zsh_autosuggest_suggest]
+  fi
+
+  add-zle-hook-widget line-pre-redraw .autocomplete.async.line-pre-redraw
+  add-zsh-hook preexec .autocomplete.async.stop
+  add-zsh-hook zshexit .autocomplete.async.stop
+}
+
+add-zsh-hook precmd .autocomplete.async.precmd
+
+.autocomplete.async.line-pre-redraw() {
+  .autocomplete.highlight
+  .autocomplete.zle-flags $LASTWIDGET
+
+  local -a words=( ${(Z+Cn+)LBUFFER##*[$'\n';|<>{}]} )
+  local w; for w in $words[@]; do
+    w=_${(q)w}
+    [[ -v functions[$w] && -z $functions_source[$w] ]] &&
+      autoload +X -Uz $w
+  done
+
+  if [[ -z $BUFFER ]] || (( KEYS_QUEUED_COUNT + PENDING > 0 )); then
+    .autocomplete.async.stop
+    return 1
+  fi
+
+  .autocomplete.async.start
+}
+
+.autocomplete.async.stop() {
+  emulate -L zsh -o extendedglob
+
+  .autocomplete.async.kill $_autocomplete__async_complete_fd $_autocomplete__async_complete_pid
+  _autocomplete__async_complete_fd=0
+  _autocomplete__async_complete_pid=0
+
+  .autocomplete.async.kill $_autocomplete__async_timeout_fd $_autocomplete__async_timeout_pid
+  _autocomplete__async_timeout_fd=0
+  _autocomplete__async_timeout_pid=0
+
+  .autocomplete.async.kill $_autocomplete__async_highlight_fd $_autocomplete__async_highlight_pid
+  _autocomplete__async_highlight_fd=0
+  _autocomplete__async_highlight_pid=0
+
+  _autocomplete__buffer=''
+  _autocomplete__word=''
+}
+
+.autocomplete.async.kill() {
+  local -i fd=$1 pid=$2
+
+  if (( fd > 9 )) && { : <&$fd } 2> /dev/null; then
+    # Close the file descriptor and remove the handler widget.
+    exec {fd}<&-
+    zle -F $fd 2> /dev/null
+  fi
+
+  if (( pid != 0 )); then
+    # Zsh will make a new process group for the child process only if job control is enabled.
+    local group='-' && [[ -o MONITOR ]] || group=''
+    kill -TERM $group$pid 2> /dev/null
+  fi
+}
+
+.autocomplete.async.start() {
+  .autocomplete.async.complete
+  [[ -v functions[_zsh_autosuggest_async_request] ]] &&
+    _zsh_autosuggest_async_request "$BUFFER"
+  [[ -v functions[_zsh_highlight] ]] &&
+    .autocomplete.async.highlight
+
+  # There's a weird bug in Zsh < 5.8, where where ^C stops working unless we force a fork.
+  # See https://github.com/zsh-users/zsh-autosuggestions/issues/364
+  command true
+}
+
+.autocomplete.async.highlight() {
+  .autocomplete.async.kill $_autocomplete__async_highlight_fd $_autocomplete__async_highlight_pid
+  exec {_autocomplete__async_highlight_fd}< <(
+    {
+      setopt extendedglob noxtrace noverbose
+
+      local pid=$sysparams[pid]
+      print $pid
+
+      _zsh_highlight
+      print $pid$'\0'${(qq)region_highlight}$'\0'$'\0'
+    } always {
+      kill -TERM $pid
+    }
+  )
+  read _autocomplete__async_highlight_pid <&$_autocomplete__async_highlight_fd
+  zle -Fw "$_autocomplete__async_highlight_fd" .autocomplete.async.highlight.fd-widget
+}
+
+.autocomplete.async.highlight.fd-widget() {
+  local pid highlight eof
+
+  {
+    [[ -z $2 || $2 == hup ]] &&
+      IFS=$'\0' read -r -u "$1" pid highlight eof
+  } always {
+    .autocomplete.async.kill $1 $pid
+  }
+
+  .autocomplete.zle-flags
+
+  _autocomplete__region_highlight=( ${(Q)${(@z)highlight}} )
+  .autocomplete.highlight
+  zle -R
+}
+
+.autocomplete.async.complete() {
+  typeset -F SECONDS=0
+
+  .autocomplete.async.kill $_autocomplete__async_complete_fd $_autocomplete__async_complete_pid
+  exec {_autocomplete__async_complete_fd}< <(
+    setopt extendedglob noxtrace noverbose
+
+    local pid=$sysparams[pid]
+    print $pid
+    {
+      local REPLY
+      zpty _autocomplete__zpty .autocomplete.async.complete.inner '$LBUFFER' '$RBUFFER'
+      zpty -w _autocomplete__zpty $'\t'
+
+      local line
+      zpty -r _autocomplete__zpty line '*'$'\0'$'\0'
+      zpty -r _autocomplete__zpty line '*'$'\0'$'\0'
+      print $pid$'\0'$SECONDS$'\0'$line
+    } always {
+      zpty -d _autocomplete__zpty
+      kill -TERM $pid
+    }
+  )
+  read _autocomplete__async_complete_pid <&$_autocomplete__async_complete_fd
+  zle -Fw "$_autocomplete__async_complete_fd" .autocomplete.async.complete.fd-widget
+
+  .autocomplete.async.kill $_autocomplete__async_timeout_fd $_autocomplete__async_timeout_pid
+  exec {_autocomplete__async_timeout_fd}< <(
+    {
+      setopt extendedglob noxtrace noverbose
+
+      local complete_pid=$_autocomplete__async_complete_pid
+      local complete_fd=$_autocomplete__async_complete_fd
+      local pid=$sysparams[pid]
+      print $pid
+      sleep $(( 10.0 * _AUTOCOMPLETE__ASYNC_TIMEOUT - SECONDS ))
+      print $pid$'\0'$complete_fd$'\0'$complete_pid$'\0'$'\0'
+    } always {
+      kill -TERM $pid
+    }
+  )
+  read _autocomplete__async_timeout_pid <&$_autocomplete__async_timeout_fd
+  zle -Fw "$_autocomplete__async_timeout_fd" .autocomplete.async.timeout.fd-widget
+}
+
+.autocomplete.async.complete.inner() {
+  setopt extendedglob nobanghist noxtrace noverbose
+
+  local hooks=( chpwd periodic precmd preexec zshaddhistory zshexit zsh_directory_name )
+  unset ${^hooks}_functions &> /dev/null
+  unfunction $hooks &> /dev/null
+  hooks=( isearch-exit isearch-update line-pre-redraw
+    line-init line-finish history-line-set keymap-select )
+  zle -D zle-${^hooks} &> /dev/null
+
+  typeset -gH lbuffer=$1 rbuffer=$2
+
+  complete-word() {
+    LBUFFER=$lbuffer
+    RBUFFER=$rbuffer
+    zle list-choices -w 2> /dev/null
+  }
+
+  message() {
+    typeset -gH message=$mesg
+  }
+
+  list-choices() {
+    local curcontext=$curcontext; [[ -z $curcontext ]] &&
+      curcontext=list-choices:::
+
+    local +h -a comppostfuncs=( _autocomplete.extras message )
+    unset 'compstate[vared]'
+
+    _main_complete &> /dev/null
+
+    compstate[insert]=''
+    compstate[list]=''
+    compstate[list_max]=0
+
+    local -i nm=$compstate[nmatches] ll=$compstate[list_lines]
+    print $'\0'$'\0'$nm$'\0'$ll$'\0'$BUFFER$'\0'${words[CURRENT]}$'\0'$message$'\0'$'\0'
+  }
+
+  zle -N complete-word
+  zle -C list-choices list-choices list-choices
+  bindkey '^I' complete-word
+  vared LBUFFER 2>&1
+}
+
+.autocomplete.async.complete.fd-widget() {
+  local -F seconds
+  local -i pid nmatches list_lines
+  local buffer word mesg eof
+  {
+    [[ -z $2 || $2 == hup ]] &&
+      IFS=$'\0' read -r -u "$1" pid seconds nmatches list_lines buffer word mesg eof
+  } always {
+    .autocomplete.async.kill $1 $pid
+  }
+
+  .autocomplete.zle-flags ||
+    return 0
+
+  if [[ $1 == $_autocomplete__async_complete_fd &&
+      $pid == $_autocomplete__async_complete_pid ]]; then
+    _autocomplete__async_complete_fd=0
+    _autocomplete__async_complete_pid=0
+  fi
+
+  [[ $_autocomplete__buffer == $buffer && $_autocomplete__word == $word ]] &&
+    return 1
+
+  _autocomplete__buffer=''
+  _autocomplete__word=''
+
+  # If a widget can't be called, ZLE always returns true.
+  # Thus, we return false on purpose, so we can check if our widget got called.
+  setopt localoptions nobanghist
+
+  if zle && zle _list_choices -w $seconds $nmatches $list_lines $mesg; then
+    functions[_zsh_autosuggest_suggest]=$functions[.autocomplete.no-op]
+  else
+    _autocomplete__buffer=$buffer
+    _autocomplete__word=$word
+
+    # Refresh if and only if our widget got called. Otherwise, ZLE will crash (eventually).
+    functions[_zsh_autosuggest_suggest]=$functions[.autocomplete._zsh_autosuggest_suggest]
+    .autocomplete.highlight
+    zle -R
+  fi
+  (( _AUTOCOMPLETE__ASYNC_TIMEOUT = .2 * seconds + .8 * _AUTOCOMPLETE__ASYNC_TIMEOUT ))
+  return 0
+}
+
+.autocomplete.list-choices.completion-widget() {
+  local curcontext=$curcontext; [[ -z $curcontext ]] &&
+    curcontext=list-choices:::
+
+  local -F seconds=$1
+  local -i nmatches=$2 list_lines=$3
+  local mesg=$4 reply
+
+  (( seconds > 2.0 * _AUTOCOMPLETE__ASYNC_TIMEOUT )) &&
+    zle -Rc "processing…"
+
+  local min_input; zstyle -s ":autocomplete:$curcontext" min-input min_input || min_input=1
+
+  if [[ $compstate[context] == command ]] &&
+      (( CURRENT == 1 && $#words[CURRENT] < min_input )); then
+    :
+  elif (( nmatches == 0 )); then
+    if [[ -n $mesg ]]; then
+      _autocomplete.explanation info $mesg
+    else
+      zstyle -s ":autocomplete:${curcontext}:no-matches-at-all" message mesg ||
+        mesg='No matching completions found.'
+      _autocomplete.explanation error $mesg
+    fi
+  else
+    {
+      local -i _autocomplete__max_lines=$(( _autocomplete__max_lines() ))
+      (( list_lines > _autocomplete__max_lines )) &&
+        functions[compadd]=$functions[.autocomplete.async.compadd]
+      _main_complete
+    } always {
+      [[ -v functions[compadd] ]] &&
+        unfunction compadd
+    }
+  fi
+  compstate[insert]=''
+  compstate[list]='list force'
+  compstate[list_max]=0
+
+  # If a widget can't be called, ZLE always returns 0.
+  # Thus, we return non-0 on purpose, so we can check if our widget got called.
+  return 2
+}
+
+.autocomplete.async.compadd() {
+  setopt localoptions listtypes
+
+  if [[ $funcstack[2] == _autocomplete.(alias_expansions|requoted|unambiguous|history_lines) ]]
+      then
+    .autocomplete.compadd "$@"
+    return
+  fi
+
+  local -a __opts=()
+  zparseopts -E -A __opts - D: E: X:
+
+  if [[ -v __opts[-E] ]]; then
+    .autocomplete.compadd "$@"
+    return
+  fi
+
+  local -a __matches=()
+  local -i fd list_lines=0
+  {
+    exec {fd}< <(
+      __opts=()
+      zparseopts -D -E -A __opts - O: A: D: X:
+      builtin compadd -O __matches "$@"
+
+      _autocomplete.compadd_opts_len "$@"
+      builtin compadd "${(@)@[1,?]}" -U -a __matches
+
+      print $compstate[list_lines]
+      print -r - ${(pj:\0:)__matches}
+    )
+    IFS=$'\0' read list_lines <&$fd
+    IFS=$'\0' read -A __matches <&$fd
+  } always {
+    exec {fd}<&-
+  }
+  __matches=( $__matches[@] )  # Filter out blanks.
+
+  local -i lines_of_new_matches=$#__matches; [[ $funcstack[2] == _describe ]] ||
+    lines_of_new_matches=$(( list_lines - compstate[list_lines] ))
+  local -i header=$+__opts[-X]
+  local -i max_lines=$(( _autocomplete__max_lines ))
+  if (( compstate[list_lines] + lines_of_new_matches + header <= max_lines )); then
+    .autocomplete.compadd "$@"
+    return
+  fi
+
+  local -i max_matches
+  if (( lines_of_new_matches > 0 )); then
+    local -i matches_per_line=$((
+      ($#__matches + lines_of_new_matches - 1 ) / lines_of_new_matches ))
+    local -i lines_available=$(( max(0, max_lines - compstate[list_lines] - header) ))
+    max_matches=$(( lines_available * matches_per_line ))
+  else
+    max_matches=$#__matches
+  fi
+
+  local info hint=$'%{\e[02;39m%}' kbd=$'%{\e[22;39m%}' end=$'%{\e[0m%}'
+  zstyle -s ":autocomplete:${curcontext}:too-many-matches" message info ||
+    info="${hint}(partial list; press ${kbd}Ctrl${hint}+${kbd}Space$hint to expand)$end"
+
+  if [[ -v __opts[-D] ]]; then
+    .autocomplete.compadd "$@"
+
+    local array_name=$__opts[-D]
+    local -i len=${#${(P)array_name}}
+    if (( max_matches < len )); then
+      shift -p $(( len - max_matches )) $array_name
+      builtin compadd -x $info
+    fi
+    (( max_matches > 0 ))
+
+  else
+    if (( max_matches < $#__matches )); then
+      shift -p $(( $#__matches - max_matches )) __matches
+      builtin compadd -x $info
+    fi
+    zparseopts -D -E -A __opts - a k U
+    _autocomplete.compadd_opts_len "$@"
+    .autocomplete.compadd "${(@)@[1,?]}" -U -a __matches
+  fi
+}
+
+.autocomplete.async.timeout.fd-widget() {
+  local -i pid complete_fd complete_pid
+  local eof
+  {
+    [[ -z $2 || $2 == hup ]] &&
+      IFS=$'\0' read -r -u "$1" pid complete_fd complete_pid eof
+  } always {
+    .autocomplete.async.kill $1 $pid
+  }
+
+  .autocomplete.zle-flags ||
+    return 0
+
+  [[ $complete_fd == $_autocomplete__async_complete_fd &&
+      $complete_pid == $_autocomplete__async_complete_pid ]] ||
+    return
+
+  .autocomplete.async.kill $complete_fd $complete_pid
+
+  [[ -z $BUFFER ]] &&
+    return
+
+  _autocomplete__buffer=''
+  _autocomplete__word=''
+
+  # If a widget can't be called, ZLE always returns 0.
+  # Thus, we return non-0 on purpose, so we can check if our widget got called.
+  setopt localoptions nobanghist
+  if zle && zle _explain -w error 'Completion timed out.'; then
+    functions[_zsh_autosuggest_suggest]=$functions[.autocomplete.no-op]
+  else
+    # Refresh if and only if our widget got called. Otherwise, ZLE will crash (eventually).
+    functions[_zsh_autosuggest_suggest]=$functions[.autocomplete._zsh_autosuggest_suggest]
+    .autocomplete.highlight
+    zle -R
+  fi
+  (( _AUTOCOMPLETE__ASYNC_TIMEOUT = 2 * _AUTOCOMPLETE__ASYNC_TIMEOUT ))
+  return 0
+}
+
+.autocomplete.async.explain.completion-widget() {
+  eval "$_comp_setup"
+
+  _autocomplete.explanation $1 $2
+  buffer=$BUFFER
+  word=$words[CURRENT]
+  compstate[list]='list force'
+  return 1
+}

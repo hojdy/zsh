@@ -1,0 +1,22 @@
+#!/bin/zsh
+
+_autocomplete__max_lines() {
+  emulate -L zsh -o extendedglob
+
+  local max_lines; zstyle -s ":autocomplete:$curcontext" max-lines max_lines ||
+    max_lines='10'
+
+  local -i screen_space=$((LINES - BUFFERLINES - 1))
+  [[ $curcontext == history-search:* ]] ||
+    (( screen_space -= 3 ))
+
+  if [[ $max_lines == *% ]]; then
+    (( max_lines = screen_space * ${max_lines%%\%} / 100 ))
+  else
+    (( max_lines = min(max_lines, screen_space) ))
+  fi
+
+  return max_lines
+}
+
+functions -M _autocomplete__max_lines

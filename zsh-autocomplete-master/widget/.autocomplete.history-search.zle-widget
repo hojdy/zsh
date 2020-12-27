@@ -1,0 +1,31 @@
+#!/bin/zsh
+setopt localoptions extendedglob nobeep
+
+local buffer=$BUFFER
+BUFFER="${(j:*:)${(bZ+C+)BUFFER}}"
+zle -R
+
+local keymap_menuselect="$(bindkey -M menuselect -L)"
+local -i ret=1
+{
+  local -A keymap_historysearch=(
+    $key[Left] .backward-char
+    $key[Right] .forward-char
+    $key[ForwardWord] .backward-word
+    $key[BackwardWord] .forward-word
+    $key[Home] .beginning-of-line
+    $key[End] .end-of-line
+  )
+  local k v; for k v in ${(kv@)keymap_historysearch}; do
+    bindkey -M menuselect $k $v
+  done
+
+  zle _history_search
+  ret=$?
+
+} always {
+  eval "$keymap_menuselect"
+  (( ret == 0 )) ||
+    BUFFER=$buffer
+}
+return ret

@@ -1,0 +1,11 @@
+#!/bin/zsh
+local curcontext=$curcontext; [[ -z $curcontext ]] &&
+  curcontext=history-search:::
+
+_main_complete _autocomplete.history_lines
+local -i ret=$?
+
+compstate[insert]='menu:0'
+compstate[list]='list force'
+
+return ret
